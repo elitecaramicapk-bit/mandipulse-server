@@ -685,3 +685,127 @@ def get_mandipulse_dashboard(
             "impact": market_impact
         }
     }
+
+
+# ============================================================
+# FASAL LISTING SYSTEM — E-Commerce
+# Kisan apni fasal list kare — Buyer dekhe
+# ============================================================
+
+# In-memory listings store (Production mein Firebase Firestore use karo)
+fasal_listings = {}
+listing_counter = 1
+
+@app.post("/api/listings/add")
+def add_listing(
+    kisan_name: str = Query(...),
+    kisan_phone: str = Query(...),
+    kisan_city: str = Query(...),
+    kisan_state: str = Query(...),
+    commodity: str = Query(...),
+    quantity_qtl: float = Query(...),
+    price_per_qtl: float = Query(...),
+    delivery_available: bool = Query(False),
+    available_till: str = Query(...),   # "2026-10-30"
+    description: str = Query(""),
+    user_id: str = Query(...)
+):
+    global listing_counter
+
+    listing_id = f"LST{listing_counter:04d}"
+    listing_counter += 1
+
+    fasal_listings[listing_id] = {
+        "listingId": listing_id,
+        "kisanName": kisan_name,
+        "kisanPhone": kisan_phone,    # Pro users ko dikhega
+        "kisanCity": kisan_city,
+        "kisanState": kisan_state,
+        "commodity": commodity,
+        "quantityQtl": quantity_qtl,
+        "pricePerQtl": price_per_qtl,
+        "totalValue": round(quantity_qtl * price_per_qtl, 0),
+        "deliveryAvailable": delivery_available,
+        "availableTill": available_till,
+        "description": description,
+        "userId": user_id,
+        "active": True,
+        "views": 0,
+        "postedOn": "today"
+    }
+
+    return {
+        "status": "✅ Listing add ho gayi!",
+        "listingId": listing_id,
+        "message": f"{commodity} ki listing successfully add hui — buyers dekh sakte hain"
+    }
+
+
+@app.get("/api/listings/all")
+def get_all_listings(
+    commodity: str = Query(None),
+    state: str = Query(None),
+    is_pro: bool = Query(False)         # Pro users ko phone number dikhega
+):
+    result = []
+    for lid, listing in fasal_listings.items():
+        if not listing["active"]:
+            continue
+        if commodity and listing["commodity"].lower() != commodity.lower():
+            continue
+        if state and listing["kisanState"].lower() != state.lower():
+            continue
+
+        # Views increment
+        listing["views"] += 1
+
+        item = {
+            "listingId": listing["listingId"],
+            "kisanName": listing["kisanName"],
+            "kisanCity": listing["kisanCity"],
+            "kisanState": listing["kisanState"],
+            "commodity": listing["commodity"],
+            "quantityQtl": listing["quantityQtl"],
+            "pricePerQtl": listing["pricePerQtl"],
+            "totalValue": listing["totalValue"],
+            "deliveryAvailable": listing["deliveryAvailable"],
+            "availableTill": listing["availableTill"],
+            "description": listing["description"],
+            "views": listing["views"],
+            "postedOn": listing["postedOn"],
+            # Pro users ko hi phone dikhega
+            "kisanPhone": listing["kisanPhone"] if is_pro else "Pro Member bano — number dekhne ke liye",
+            "phoneVisible": is_pro
+        }
+        result.append(item)
+
+    # Latest pehle
+    result.reverse()
+
+    return {
+        "totalListings": len(result),
+        "listings": result,
+        "proTip": "Pro membership lo — kisan ka direct number dekho!" if not is_pro else None
+    }
+
+
+@app.delete("/api/listings/delete")
+def delete_listing(
+    listing_id: str = Query(...),
+    user_id: str = Query(...)
+):
+    if listing_id not in fasal_listings:
+        raise HTTPException(status_code=404, detail="Listing nahi mili")
+
+    listing = fasal_listings[listing_id]
+    if listing["userId"] != user_id:
+        raise HTTPException(status_code=403, detail="Yeh tumhari listing nahi hai")
+
+    fasal_listings[listing_id]["active"] = False
+    return {"status": "✅ Listing hata di gayi", "listingId": listing_id}
+
+
+@app.get("/api/listings/my")
+def get_my_listings(user_id: str = Query(...)):
+    my = [v for v in fasal_listings.values() if v["userId"] == user_id and v["active"]]
+    return {"myListings": my, "total": len(my)}
