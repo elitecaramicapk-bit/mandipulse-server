@@ -36,7 +36,8 @@ def safe_float(val, default=0.0):
     except: return default
 
 def get_mandi_data(commodity: str, state: str, city: str):
-    # EXACT MAPPING BASED ON LIVE API TESTING
+    # The app now sends exact official names. We maintain this map for
+    # backward compatibility with older versions or simple name fallbacks.
     commodity_map = {
         "Wheat": "Wheat",
         "Moong": "Green Gram(Moong)(Whole)",
@@ -52,9 +53,20 @@ def get_mandi_data(commodity: str, state: str, city: str):
         "Bajra": "Bajra(Pearl Millet/Cumbu)",
         "Jowar": "Jowar(Sorghum)",
         "Jeera": "Cummin Seed(Jeera)",
-        "Cumin": "Cummin Seed(Jeera)"
+        "Cumin": "Cummin Seed(Jeera)",
+        "Urad": "Black Gram (Urad)(Whole)",
+        "Masoor": "Lentil (Masur)(Whole)",
+        "Arhar": "Arhar (Tur/Red Gram)",
+        "Tur": "Arhar (Tur/Red Gram)",
+        "Groundnut": "Groundnut",
+        "Chilli": "Chilli Red",
+        "Coriander": "Coriander(Seed)",
+        "Fennel": "Fennel(Saunf)",
+        "Rice": "Rice",
+        "Sugarcane": "Sugarcane"
     }
 
+    # Prioritize incoming name, fallback to map if not found in official format
     mapped_commodity = commodity_map.get(commodity, commodity)
 
     # Try multiple search strategies
