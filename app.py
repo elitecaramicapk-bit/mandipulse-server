@@ -1,6 +1,6 @@
 # ============================================================
 # MANDI BHAV + WEATHER PREDICTION SYSTEM
-# FastAPI Server — app.py (EXACT NAME MATCHING VERSION 2.10.0)
+# FastAPI Server — app.py (DUAL DATE VERSION 2.11.0)
 # ============================================================
 
 from fastapi import FastAPI, Query, Header, HTTPException
@@ -11,8 +11,8 @@ from datetime import datetime
 
 app = FastAPI(
     title="Mandi Bhav Prediction API",
-    description="Precise matching with exact government commodity names",
-    version="2.10.0"
+    description="Precise matching with exact government commodity names and dual dates",
+    version="2.11.0"
 )
 
 app.add_middleware(
@@ -36,8 +36,6 @@ def safe_float(val, default=0.0):
     except: return default
 
 def get_mandi_data(commodity: str, state: str, city: str):
-    # The app now sends exact official names. We maintain this map for
-    # backward compatibility with older versions or simple name fallbacks.
     commodity_map = {
         "Wheat": "Wheat",
         "Moong": "Green Gram(Moong)(Whole)",
@@ -66,21 +64,18 @@ def get_mandi_data(commodity: str, state: str, city: str):
         "Sugarcane": "Sugarcane"
     }
 
-    # Prioritize incoming name, fallback to map if not found in official format
     mapped_commodity = commodity_map.get(commodity, commodity)
 
-    # Try multiple search strategies
     search_queries = [
-        {"filters[commodity]": mapped_commodity, "filters[state]": state, "filters[market]": city}, # Exact Market
-        {"filters[commodity]": mapped_commodity, "filters[state]": state}, # State-wide
-        {"filters[state]": state, "filters[market]": city} # Any crop in this market (to verify market name)
+        {"filters[commodity]": mapped_commodity, "filters[state]": state, "filters[market]": city},
+        {"filters[commodity]": mapped_commodity, "filters[state]": state},
+        {"filters[state]": state, "filters[market]": city}
     ]
 
     final_source = "मंडी"
 
     for i, q in enumerate(search_queries):
         try:
-            # We fetch more records because server-side sorting by date is currently broken/unsupported
             url = f"https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key={DATA_GOV_API_KEY}&format=json&limit=200"
             for k, v in q.items():
                 url += f"&{k}={v}"
@@ -89,21 +84,18 @@ def get_mandi_data(commodity: str, state: str, city: str):
             records = res.get('records', [])
 
             if records:
-                # If we were searching for ANY crop just to verify market, only proceed if commodity matches somewhere
                 if i == 2:
                     records = [r for r in records if commodity.lower() in r.get('commodity', '').lower()]
                     if not records: continue
 
                 if i == 1: final_source = f"{state} औसत"
 
-                # Manual Date Parsing and Local Sorting
                 for r in records:
                     try: r['dt'] = datetime.strptime(r.get('arrival_date', '01/01/2000'), '%d/%m/%Y')
                     except: r['dt'] = datetime(2000, 1, 1)
 
                 sorted_recs = sorted(records, key=lambda x: x['dt'], reverse=True)
 
-                # Extract two latest distinct dates
                 days = []
                 for r in sorted_recs:
                     p = safe_float(r.get('modal_price'))
@@ -119,14 +111,17 @@ def get_mandi_data(commodity: str, state: str, city: str):
                     if len(days) >= 2: break
 
                 if days:
-                    curr = days[0]['price']
-                    prev = days[1]['price'] if len(days) >= 2 else curr
-                    return curr, prev, days[0]['arrival'], days[0]['date_str'], final_source
+                    curr_p = days[0]['price']
+                    prev_p = days[1]['price'] if len(days) >= 2 else curr_p
+                    curr_d = days[0]['date_str']
+                    prev_d = days[1]['date_str'] if len(days) >= 2 else curr_d
+                    arr = days[0]['arrival']
+                    return curr_p, prev_p, arr, curr_d, prev_d, final_source
         except Exception as e:
             print(f"Strategy {i} failed: {e}")
             continue
 
-    return None, None, None, "", ""
+    return None, None, None, "", "", ""
 
 def get_weather_risk(city: str):
     try:
@@ -146,13 +141,13 @@ def get_weather_risk(city: str):
 # ============================================================
 @app.get("/api/mandi-predictions")
 def get_predictions(commodity: str = Query(...), state: str = Query(...), city: str = Query(...)):
-    cur, prev, arr, date, source = get_mandi_data(commodity, state, city)
+    cur, prev, arr, date, prev_date, source = get_mandi_data(commodity, state, city)
 
     if cur is None:
         return {
             "locationName": f"{city}, {state}", "commodityName": commodity,
             "currentPrice": 0.0, "yesterdayPrice": 0.0, "priceChange": 0.0,
-            "arrivalQuantity": 0, "updateDate": "N/A", "isRainExpected": False,
+            "arrivalQuantity": 0, "updateDate": "N/A", "yesterdayDate": "N/A", "isRainExpected": False,
             "weatherAlert": "डेटा नहीं मिला", "marketImpact": "N/A", "cropImpactIndex": "मंडी बंद या नाम गलत",
             "predictedMinPrice": 0.0, "predictedMaxPrice": 0.0, "predictionNote": f"सरकारी पोर्टल पर {commodity} का रिकॉर्ड नहीं मिला।"
         }
@@ -161,22 +156,22 @@ def get_predictions(commodity: str = Query(...), state: str = Query(...), city: 
     return {
         "locationName": f"{city} ({source})", "commodityName": commodity,
         "currentPrice": cur, "yesterdayPrice": prev, "priceChange": cur - prev,
-        "arrivalQuantity": arr, "updateDate": date, "isRainExpected": is_rain,
+        "arrivalQuantity": arr, "updateDate": date, "yesterdayDate": prev_date, "isRainExpected": is_rain,
         "weatherAlert": alert, "marketImpact": impact, "cropImpactIndex": "स्थिर",
         "predictedMinPrice": round(cur * 0.95, 0), "predictedMaxPrice": round(cur * 1.15, 0),
         "predictionNote": f"{source} डेटा आधारित"
     }
 
 @app.get("/")
-def root(): return {"status": "✅ MandiPulse Server Active", "version": "2.10.0"}
+def root(): return {"status": "✅ MandiPulse Server Active", "version": "2.11.0"}
 
 @app.get("/api/mandipulse/dashboard")
 def get_dashboard(commodity: str = Query(...), state: str = Query(...), city: str = Query(...)):
-    cur, prev, arr, date, source = get_mandi_data(commodity, state, city)
+    cur, prev, arr, date, prev_date, source = get_mandi_data(commodity, state, city)
     if cur is None:
         return {
             "appName": "MandiPulse 💓", "commodity": commodity, "location": f"{city}, {state}",
-            "currentPrice": 0.0, "arrivalQty": 0,
+            "currentPrice": 0.0, "yesterdayPrice": 0.0, "arrivalQty": 0, "updateDate": "N/A", "yesterdayDate": "N/A",
             "bechainIndex": {"signal": "NONE", "signalHindi": "डेटा नहीं ⚪", "score": 0, "advice": "सरकारी डेटा अपडेट नहीं हुआ है।"},
             "fasalCalendar": {"bestMonth": "N/A", "bestPrice": 0.0, "worstMonth": "N/A", "sellAdvice": "बाद में चेक करें"},
             "mandiHeatMap": {"hottestMandi": city, "top3": []},
@@ -186,7 +181,7 @@ def get_dashboard(commodity: str = Query(...), state: str = Query(...), city: st
     is_rain, impact, alert = get_weather_risk(city)
     return {
         "appName": "MandiPulse 💓", "commodity": commodity, "location": f"{city} ({source})",
-        "currentPrice": cur, "arrivalQty": arr,
+        "currentPrice": cur, "yesterdayPrice": prev, "arrivalQty": arr, "updateDate": date, "yesterdayDate": prev_date,
         "bechainIndex": {"signal": "WAIT" if cur >= prev else "BUY", "signalHindi": "रुको 🟡" if cur >= prev else "खरीदो 🟢", "score": 70, "advice": f"अंतिम अपडेट: {date}"},
         "fasalCalendar": {"bestMonth": "मई", "bestPrice": cur*1.12, "worstMonth": "जनवरी", "sellAdvice": "Hold for better price"},
         "mandiHeatMap": {"hottestMandi": city, "top3": []},
