@@ -1,6 +1,6 @@
 # ============================================================
 # MANDI BHAV + WEATHER PREDICTION SYSTEM
-# FastAPI Server — app.py (DUAL DATE VERSION 2.11.0)
+# FastAPI Server — app.py (MAINTENANCE DETECTION VERSION 2.13.0)
 # ============================================================
 
 from fastapi import FastAPI, Query, Header, HTTPException
@@ -10,9 +10,9 @@ from typing import Optional
 from datetime import datetime
 
 app = FastAPI(
-    title="Mandi Bhav Prediction API",
-    description="Precise matching with exact government commodity names and dual dates",
-    version="2.11.0"
+    title="Mandi Pulse API",
+    description="Intelligent maintenance detection and multi-level search",
+    version="2.13.0"
 )
 
 app.add_middleware(
@@ -35,61 +35,49 @@ def safe_float(val, default=0.0):
     try: return float(val) if val and val != "None" else default
     except: return default
 
+def check_gov_api_status():
+    """Check if the government database is empty/under maintenance"""
+    try:
+        url = f"https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key={DATA_GOV_API_KEY}&format=json&limit=1"
+        res = requests.get(url, timeout=5).json()
+        total = res.get('total', 0)
+        # Normally total is > 100,000. If it's very small, it's maintenance.
+        return True if total > 500 else False
+    except:
+        return False
+
 def get_mandi_data(commodity: str, state: str, city: str):
     commodity_map = {
-        "Wheat": "Wheat",
-        "Moong": "Green Gram(Moong)(Whole)",
-        "Gram": "Bengal Gram(Gram)(Whole)",
-        "Chana": "Bengal Gram(Gram)(Whole)",
-        "Mustard": "Mustard",
-        "Soybean": "Soyabean",
-        "Onion": "Onion",
-        "Garlic": "Garlic",
-        "Potato": "Potato",
-        "Tomato": "Tomato",
-        "Cotton": "Cotton",
-        "Bajra": "Bajra(Pearl Millet/Cumbu)",
-        "Jowar": "Jowar(Sorghum)",
-        "Jeera": "Cummin Seed(Jeera)",
-        "Cumin": "Cummin Seed(Jeera)",
-        "Urad": "Black Gram (Urad)(Whole)",
-        "Masoor": "Lentil (Masur)(Whole)",
-        "Arhar": "Arhar (Tur/Red Gram)",
-        "Tur": "Arhar (Tur/Red Gram)",
-        "Groundnut": "Groundnut",
-        "Chilli": "Chilli Red",
-        "Coriander": "Coriander(Seed)",
-        "Fennel": "Fennel(Saunf)",
-        "Rice": "Rice",
-        "Sugarcane": "Sugarcane"
+        "Wheat": "Wheat", "Moong": "Green Gram(Moong)(Whole)", "Gram": "Bengal Gram(Gram)(Whole)",
+        "Chana": "Bengal Gram(Gram)(Whole)", "Mustard": "Mustard", "Soybean": "Soyabean",
+        "Onion": "Onion", "Garlic": "Garlic", "Potato": "Potato", "Tomato": "Tomato",
+        "Cotton": "Cotton", "Bajra": "Bajra(Pearl Millet/Cumbu)", "Jowar": "Jowar(Sorghum)",
+        "Jeera": "Cummin Seed(Jeera)", "Cumin": "Cummin Seed(Jeera)", "Urad": "Black Gram (Urad)(Whole)",
+        "Masoor": "Lentil (Masur)(Whole)", "Arhar": "Arhar (Tur/Red Gram)", "Rice": "Rice"
     }
 
+    state_map = {"Kerala": "Keralam", "Odisha": "Orissa"}
+    search_state = state_map.get(state, state)
     mapped_commodity = commodity_map.get(commodity, commodity)
 
     search_queries = [
-        {"filters[commodity]": mapped_commodity, "filters[state]": state, "filters[market]": city},
-        {"filters[commodity]": mapped_commodity, "filters[state]": state},
-        {"filters[state]": state, "filters[market]": city}
+        {"filters[commodity]": mapped_commodity, "filters[state]": search_state, "filters[market]": city},
+        {"filters[commodity]": mapped_commodity, "filters[state]": search_state},
+        {"filters[commodity]": mapped_commodity}
     ]
 
-    final_source = "मंडी"
+    source_labels = ["मंडी", f"{state} औसत", "अखिल भारतीय औसत"]
 
     for i, q in enumerate(search_queries):
         try:
-            url = f"https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key={DATA_GOV_API_KEY}&format=json&limit=200"
+            url = f"https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key={DATA_GOV_API_KEY}&format=json&limit=500"
             for k, v in q.items():
                 url += f"&{k}={v}"
 
-            res = requests.get(url, timeout=12).json()
+            res = requests.get(url, timeout=15).json()
             records = res.get('records', [])
 
             if records:
-                if i == 2:
-                    records = [r for r in records if commodity.lower() in r.get('commodity', '').lower()]
-                    if not records: continue
-
-                if i == 1: final_source = f"{state} औसत"
-
                 for r in records:
                     try: r['dt'] = datetime.strptime(r.get('arrival_date', '01/01/2000'), '%d/%m/%Y')
                     except: r['dt'] = datetime(2000, 1, 1)
@@ -116,9 +104,8 @@ def get_mandi_data(commodity: str, state: str, city: str):
                     curr_d = days[0]['date_str']
                     prev_d = days[1]['date_str'] if len(days) >= 2 else curr_d
                     arr = days[0]['arrival']
-                    return curr_p, prev_p, arr, curr_d, prev_d, final_source
-        except Exception as e:
-            print(f"Strategy {i} failed: {e}")
+                    return curr_p, prev_p, arr, curr_d, prev_d, source_labels[i]
+        except:
             continue
 
     return None, None, None, "", "", ""
@@ -141,6 +128,16 @@ def get_weather_risk(city: str):
 # ============================================================
 @app.get("/api/mandi-predictions")
 def get_predictions(commodity: str = Query(...), state: str = Query(...), city: str = Query(...)):
+    # Quick Check: Is Gov Database empty?
+    if not check_gov_api_status():
+        return {
+            "locationName": f"{city}, {state}", "commodityName": commodity,
+            "currentPrice": 0.0, "yesterdayPrice": 0.0, "priceChange": 0.0,
+            "arrivalQuantity": 0, "updateDate": "N/A", "yesterdayDate": "N/A", "isRainExpected": False,
+            "weatherAlert": "सर्वर मेंटेनेंस", "marketImpact": "रुकावट", "cropImpactIndex": "सरकारी पोर्टल डाउन",
+            "predictedMinPrice": 0.0, "predictedMaxPrice": 0.0, "predictionNote": "सरकारी वेबसाइट (api.data.gov.in) पर मेंटेनेंस चल रहा है। कृपया 1-2 घंटे बाद प्रयास करें।"
+        }
+
     cur, prev, arr, date, prev_date, source = get_mandi_data(commodity, state, city)
 
     if cur is None:
@@ -148,8 +145,8 @@ def get_predictions(commodity: str = Query(...), state: str = Query(...), city: 
             "locationName": f"{city}, {state}", "commodityName": commodity,
             "currentPrice": 0.0, "yesterdayPrice": 0.0, "priceChange": 0.0,
             "arrivalQuantity": 0, "updateDate": "N/A", "yesterdayDate": "N/A", "isRainExpected": False,
-            "weatherAlert": "डेटा नहीं मिला", "marketImpact": "N/A", "cropImpactIndex": "मंडी बंद या नाम गलत",
-            "predictedMinPrice": 0.0, "predictedMaxPrice": 0.0, "predictionNote": f"सरकारी पोर्टल पर {commodity} का रिकॉर्ड नहीं मिला।"
+            "weatherAlert": "डेटा उपलब्ध नहीं", "marketImpact": "N/A", "cropImpactIndex": "मंडी बंद",
+            "predictedMinPrice": 0.0, "predictedMaxPrice": 0.0, "predictionNote": f"सरकारी पोर्टल पर {commodity} का कोई हालिया रिकॉर्ड नहीं मिला।"
         }
 
     is_rain, impact, alert = get_weather_risk(city)
@@ -162,16 +159,23 @@ def get_predictions(commodity: str = Query(...), state: str = Query(...), city: 
         "predictionNote": f"{source} डेटा आधारित"
     }
 
-@app.get("/")
-def root(): return {"status": "✅ MandiPulse Server Active", "version": "2.11.0"}
-
 @app.get("/api/mandipulse/dashboard")
 def get_dashboard(commodity: str = Query(...), state: str = Query(...), city: str = Query(...)):
+    if not check_gov_api_status():
+        return {
+            "appName": "MandiPulse 💓", "commodity": commodity, "location": f"{city}, {state}",
+            "currentPrice": 0.0, "arrivalQty": 0,
+            "bechainIndex": {"signal": "NONE", "signalHindi": "सर्वर डाउन ⚪", "score": 0, "advice": "सरकारी डेटा पोर्टल अभी काम नहीं कर रहा है।"},
+            "fasalCalendar": {"bestMonth": "N/A", "bestPrice": 0.0, "worstMonth": "N/A", "sellAdvice": "मेंटेनेंस जारी है"},
+            "mandiHeatMap": {"hottestMandi": city, "top3": []},
+            "weather": {"isRain": False, "alert": "N/A", "impact": "N/A"}
+        }
+
     cur, prev, arr, date, prev_date, source = get_mandi_data(commodity, state, city)
     if cur is None:
         return {
             "appName": "MandiPulse 💓", "commodity": commodity, "location": f"{city}, {state}",
-            "currentPrice": 0.0, "yesterdayPrice": 0.0, "arrivalQty": 0, "updateDate": "N/A", "yesterdayDate": "N/A",
+            "currentPrice": 0.0, "arrivalQty": 0,
             "bechainIndex": {"signal": "NONE", "signalHindi": "डेटा नहीं ⚪", "score": 0, "advice": "सरकारी डेटा अपडेट नहीं हुआ है।"},
             "fasalCalendar": {"bestMonth": "N/A", "bestPrice": 0.0, "worstMonth": "N/A", "sellAdvice": "बाद में चेक करें"},
             "mandiHeatMap": {"hottestMandi": city, "top3": []},
@@ -187,3 +191,6 @@ def get_dashboard(commodity: str = Query(...), state: str = Query(...), city: st
         "mandiHeatMap": {"hottestMandi": city, "top3": []},
         "weather": {"isRain": is_rain, "alert": alert, "impact": impact}
     }
+
+@app.get("/")
+def root(): return {"status": "✅ MandiPulse Server Active", "version": "2.13.0"}
