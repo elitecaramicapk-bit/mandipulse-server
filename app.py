@@ -1,6 +1,6 @@
 # ============================================================
 # MANDI BHAV + WEATHER PREDICTION SYSTEM
-# FastAPI Server — app.py (MARKET OUTLOOK VERSION 2.17.0)
+# FastAPI Server — app.py (STABILITY FIX VERSION 2.18.0)
 # ============================================================
 
 from fastapi import FastAPI, Query, Header, HTTPException
@@ -12,8 +12,8 @@ import random
 
 app = FastAPI(
     title="Mandi Pulse API",
-    description="Dynamic Markets + Demand-Supply Forecast",
-    version="2.17.0"
+    description="Stability Fix: Always returns complete data structures",
+    version="2.18.0"
 )
 
 app.add_middleware(
@@ -45,7 +45,6 @@ def safe_float(val, default=0.0):
     except: return default
 
 def get_market_outlook(curr_p, prev_p, curr_arr, prev_arr):
-    """Calculates outlook based on Demand-Supply rules"""
     if curr_p > prev_p and curr_arr < prev_arr:
         return "तेजी 📈 (मांग ज्यादा, आवक कम)", "बाजार में माल कम है, भाव और बढ़ सकते हैं।"
     elif curr_p < prev_p and curr_arr > prev_arr:
@@ -57,24 +56,18 @@ def get_market_outlook(curr_p, prev_p, curr_arr, prev_arr):
 
 def get_mandi_data(commodity: str, state: str, city: str):
     mapped_commodity = COMMODITY_MAP.get(commodity, commodity)
-
     try:
         url = f"https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key={DATA_GOV_API_KEY}&format=json&limit=100"
         url += f"&filters[commodity]={mapped_commodity}&filters[state]={state}"
-
         res = requests.get(url, timeout=10).json()
         records = res.get('records', [])
-
         if records:
             market_recs = [r for r in records if city.lower() in r.get('market', '').lower()]
             active_recs = market_recs if market_recs else records
-
             for r in active_recs:
                 try: r['dt'] = datetime.strptime(r.get('arrival_date', '01/01/2000'), '%d/%m/%Y')
                 except: r['dt'] = datetime(2000, 1, 1)
-
             sorted_recs = sorted(active_recs, key=lambda x: x['dt'], reverse=True)
-
             days = []
             for r in sorted_recs:
                 p_avg = safe_float(r.get('modal_price'))
@@ -86,14 +79,11 @@ def get_mandi_data(commodity: str, state: str, city: str):
                             'date': d, 'arrival': int(safe_float(r.get('arrivals_in_qtl'))), 'date_str': r.get('arrival_date')
                         })
                 if len(days) >= 2: break
-
             if days:
                 source = "मंडी" if market_recs else f"{state} औसत"
                 curr = days[0]
                 prev = days[1] if len(days) >= 2 else curr
-
                 outlook_title, outlook_desc = get_market_outlook(curr['avg'], prev['avg'], curr['arrival'], prev['arrival'])
-
                 return {
                     "avg": curr['avg'], "max": curr['max'], "min": curr['min'],
                     "prev_avg": prev['avg'], "arrival": curr['arrival'], "prev_arrival": prev['arrival'],
@@ -121,7 +111,6 @@ def get_weather_risk(city: str):
 
 @app.get("/api/markets")
 def get_active_markets(commodity: str, state: str):
-    """Returns list of markets that have data for this commodity"""
     mapped_commodity = COMMODITY_MAP.get(commodity, commodity)
     try:
         url = f"https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070?api-key={DATA_GOV_API_KEY}&format=json&limit=200"
@@ -138,7 +127,12 @@ def get_predictions(commodity: str = Query(...), state: str = Query(...), city: 
     is_rain, impact, alert = get_weather_risk(city)
 
     if not data:
-        return {"locationName": city, "commodityName": commodity, "currentPrice": 0.0, "updateDate": "N/A", "weatherAlert": alert}
+        return {
+            "locationName": city, "commodityName": commodity, "currentPrice": 0.0, "maxPrice": 0.0, "minPrice": 0.0,
+            "yesterdayPrice": 0.0, "priceChange": 0.0, "arrivalQuantity": 0, "updateDate": "N/A", "yesterdayDate": "N/A",
+            "isRainExpected": is_rain, "weatherAlert": alert, "marketImpact": impact, "cropImpactIndex": "डेटा नहीं मिला",
+            "predictionNote": "सरकारी पोर्टल पर रिकॉर्ड उपलब्ध नहीं है।", "predictedMinPrice": 0.0, "predictedMaxPrice": 0.0
+        }
 
     return {
         "locationName": f"{city} ({data['source']})", "commodityName": commodity,
@@ -156,17 +150,29 @@ def get_dashboard(commodity: str = Query(...), state: str = Query(...), city: st
     data = get_mandi_data(commodity, state, city)
     is_rain, impact, alert = get_weather_risk(city)
 
-    if not data: return {"appName": "MandiPulse 💓", "commodity": commodity, "currentPrice": 0.0}
+    # Default structures to prevent Android crash
+    empty_bechain = {"signal": "NONE", "signalHindi": "डेटा नहीं ⚪", "score": 0, "advice": "बाज़ार रिपोर्ट्स उपलब्ध नहीं हैं।"}
+    empty_calendar = {"bestMonth": "N/A", "bestPrice": 0.0, "worstMonth": "N/A", "sellAdvice": "Hold"}
+    empty_heatmap = {"hottestMandi": city, "top3": []}
+    weather_data = {"isRain": is_rain, "alert": alert, "impact": impact}
+
+    if not data:
+        return {
+            "appName": "MandiPulse 💓", "tagline": "Live accurate data", "commodity": commodity, "location": city,
+            "currentPrice": 0.0, "maxPrice": 0.0, "minPrice": 0.0, "yesterdayPrice": 0.0, "arrivalQty": 0,
+            "updateDate": "N/A", "yesterdayDate": "N/A", "bechainIndex": empty_bechain,
+            "fasalCalendar": empty_calendar, "mandiHeatMap": empty_heatmap, "weather": weather_data
+        }
 
     return {
-        "appName": "MandiPulse 💓", "commodity": commodity, "location": f"{city} ({data['source']})",
+        "appName": "MandiPulse 💓", "tagline": "Mandi ki dhadkan", "commodity": commodity, "location": f"{city} ({data['source']})",
         "currentPrice": data['avg'], "maxPrice": data['max'], "minPrice": data['min'],
-        "arrivalQty": data['arrival'], "updateDate": data['date'], "yesterdayDate": data['prev_date'],
+        "yesterdayPrice": data['prev_avg'], "arrivalQty": data['arrival'], "updateDate": data['date'], "yesterdayDate": data['prev_date'],
         "bechainIndex": {"signal": "WAIT" if data['avg'] >= data['prev_avg'] else "BUY", "signalHindi": data['outlook_title'], "score": 70, "advice": data['outlook_desc']},
         "fasalCalendar": {"bestMonth": "मई", "bestPrice": data['avg']*1.12, "worstMonth": "जनवरी", "sellAdvice": "Hold for better price"},
         "mandiHeatMap": {"hottestMandi": city, "top3": []},
-        "weather": {"isRain": is_rain, "alert": alert, "impact": impact}
+        "weather": weather_data
     }
 
 @app.get("/")
-def root(): return {"status": "MandiPulse v2.17 Online"}
+def root(): return {"status": "MandiPulse v2.18 Online"}
