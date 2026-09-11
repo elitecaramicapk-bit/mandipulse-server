@@ -128,14 +128,17 @@ def get_weather_risk(city: str):
 # ============================================================
 @app.get("/api/mandi-predictions")
 def get_predictions(commodity: str = Query(...), state: str = Query(...), city: str = Query(...)):
+    # Always fetch weather first
+    is_rain, impact, alert = get_weather_risk(city)
+
     # Quick Check: Is Gov Database empty?
     if not check_gov_api_status():
         return {
             "locationName": f"{city}, {state}", "commodityName": commodity,
             "currentPrice": 0.0, "yesterdayPrice": 0.0, "priceChange": 0.0,
-            "arrivalQuantity": 0, "updateDate": "N/A", "yesterdayDate": "N/A", "isRainExpected": False,
-            "weatherAlert": "सर्वर मेंटेनेंस", "marketImpact": "रुकावट", "cropImpactIndex": "सरकारी पोर्टल डाउन",
-            "predictedMinPrice": 0.0, "predictedMaxPrice": 0.0, "predictionNote": "सरकारी वेबसाइट (api.data.gov.in) पर मेंटेनेंस चल रहा है। कृपया 1-2 घंटे बाद प्रयास करें।"
+            "arrivalQuantity": 0, "updateDate": "N/A", "yesterdayDate": "N/A", "isRainExpected": is_rain,
+            "weatherAlert": alert, "marketImpact": impact, "cropImpactIndex": "सरकारी पोर्टल डाउन",
+            "predictedMinPrice": 0.0, "predictedMaxPrice": 0.0, "predictionNote": "सरकारी वेबसाइट (api.data.gov.in) पर मेंटेनेंस चल रहा है।"
         }
 
     cur, prev, arr, date, prev_date, source = get_mandi_data(commodity, state, city)
@@ -144,12 +147,11 @@ def get_predictions(commodity: str = Query(...), state: str = Query(...), city: 
         return {
             "locationName": f"{city}, {state}", "commodityName": commodity,
             "currentPrice": 0.0, "yesterdayPrice": 0.0, "priceChange": 0.0,
-            "arrivalQuantity": 0, "updateDate": "N/A", "yesterdayDate": "N/A", "isRainExpected": False,
-            "weatherAlert": "डेटा उपलब्ध नहीं", "marketImpact": "N/A", "cropImpactIndex": "मंडी बंद",
+            "arrivalQuantity": 0, "updateDate": "N/A", "yesterdayDate": "N/A", "isRainExpected": is_rain,
+            "weatherAlert": alert, "marketImpact": impact, "cropImpactIndex": "मंडी बंद",
             "predictedMinPrice": 0.0, "predictedMaxPrice": 0.0, "predictionNote": f"सरकारी पोर्टल पर {commodity} का कोई हालिया रिकॉर्ड नहीं मिला।"
         }
 
-    is_rain, impact, alert = get_weather_risk(city)
     return {
         "locationName": f"{city} ({source})", "commodityName": commodity,
         "currentPrice": cur, "yesterdayPrice": prev, "priceChange": cur - prev,
@@ -161,35 +163,39 @@ def get_predictions(commodity: str = Query(...), state: str = Query(...), city: 
 
 @app.get("/api/mandipulse/dashboard")
 def get_dashboard(commodity: str = Query(...), state: str = Query(...), city: str = Query(...)):
+    # Always fetch weather first so it's never N/A
+    is_rain, impact, alert = get_weather_risk(city)
+
+    weather_data = {"isRain": is_rain, "alert": alert, "impact": impact}
+
     if not check_gov_api_status():
         return {
             "appName": "MandiPulse 💓", "commodity": commodity, "location": f"{city}, {state}",
-            "currentPrice": 0.0, "arrivalQty": 0,
+            "currentPrice": 0.0, "yesterdayPrice": 0.0, "arrivalQty": 0, "updateDate": "N/A", "yesterdayDate": "N/A",
             "bechainIndex": {"signal": "NONE", "signalHindi": "सर्वर डाउन ⚪", "score": 0, "advice": "सरकारी डेटा पोर्टल अभी काम नहीं कर रहा है।"},
             "fasalCalendar": {"bestMonth": "N/A", "bestPrice": 0.0, "worstMonth": "N/A", "sellAdvice": "मेंटेनेंस जारी है"},
             "mandiHeatMap": {"hottestMandi": city, "top3": []},
-            "weather": {"isRain": False, "alert": "N/A", "impact": "N/A"}
+            "weather": weather_data
         }
 
     cur, prev, arr, date, prev_date, source = get_mandi_data(commodity, state, city)
     if cur is None:
         return {
             "appName": "MandiPulse 💓", "commodity": commodity, "location": f"{city}, {state}",
-            "currentPrice": 0.0, "arrivalQty": 0,
+            "currentPrice": 0.0, "yesterdayPrice": 0.0, "arrivalQty": 0, "updateDate": "N/A", "yesterdayDate": "N/A",
             "bechainIndex": {"signal": "NONE", "signalHindi": "डेटा नहीं ⚪", "score": 0, "advice": "सरकारी डेटा अपडेट नहीं हुआ है।"},
             "fasalCalendar": {"bestMonth": "N/A", "bestPrice": 0.0, "worstMonth": "N/A", "sellAdvice": "बाद में चेक करें"},
             "mandiHeatMap": {"hottestMandi": city, "top3": []},
-            "weather": {"isRain": False, "alert": "N/A", "impact": "N/A"}
+            "weather": weather_data
         }
 
-    is_rain, impact, alert = get_weather_risk(city)
     return {
         "appName": "MandiPulse 💓", "commodity": commodity, "location": f"{city} ({source})",
         "currentPrice": cur, "yesterdayPrice": prev, "arrivalQty": arr, "updateDate": date, "yesterdayDate": prev_date,
         "bechainIndex": {"signal": "WAIT" if cur >= prev else "BUY", "signalHindi": "रुको 🟡" if cur >= prev else "खरीदो 🟢", "score": 70, "advice": f"अंतिम अपडेट: {date}"},
         "fasalCalendar": {"bestMonth": "मई", "bestPrice": cur*1.12, "worstMonth": "जनवरी", "sellAdvice": "Hold for better price"},
         "mandiHeatMap": {"hottestMandi": city, "top3": []},
-        "weather": {"isRain": is_rain, "alert": alert, "impact": impact}
+        "weather": weather_data
     }
 
 @app.get("/")
