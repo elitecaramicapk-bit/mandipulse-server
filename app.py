@@ -1,6 +1,6 @@
 # ============================================================
 # MANDI BHAV + WEATHER PREDICTION SYSTEM
-# FastAPI Server — app.py (FULL ENDPOINTS RESTORED v2.19.0)
+# FastAPI Server — app.py (NULL SAFETY FIX v2.20.0)
 # ============================================================
 
 from fastapi import FastAPI, Query, HTTPException, Header
@@ -13,8 +13,8 @@ import feedparser
 
 app = FastAPI(
     title="Mandi Pulse API",
-    description="Full suite of Mandi Bhav features",
-    version="2.19.0"
+    description="Full suite of Mandi Bhav features with default values",
+    version="2.20.0"
 )
 
 app.add_middleware(
@@ -94,22 +94,55 @@ def get_mandi_data(commodity: str, state: str, city: str):
 def get_predictions(commodity: str = Query(...), state: str = Query(...), city: str = Query(...)):
     data = get_mandi_data(commodity, state, city)
     is_rain, impact, alert = get_weather_risk(city)
+
     if not data:
-        return {"locationName": city, "currentPrice": 0.0, "weatherAlert": alert}
+        return {
+            "locationName": city,
+            "commodityName": commodity,
+            "currentPrice": 0.0,
+            "maxPrice": 0.0,
+            "minPrice": 0.0,
+            "yesterdayPrice": 0.0,
+            "priceChange": 0.0,
+            "arrivalQuantity": 0,
+            "updateDate": "N/A",
+            "yesterdayDate": "N/A",
+            "isRainExpected": is_rain,
+            "weatherAlert": alert,
+            "marketImpact": impact,
+            "cropImpactIndex": "डेटा नहीं मिला",
+            "predictedMinPrice": 0.0,
+            "predictedMaxPrice": 0.0,
+            "predictionNote": "बाजार में अभी डेटा उपलब्ध नहीं है।"
+        }
+
     return {
         "locationName": city, "commodityName": commodity, "currentPrice": data['avg'],
         "maxPrice": data['max'], "minPrice": data['min'], "yesterdayPrice": data['prev_avg'],
         "priceChange": data['avg'] - data['prev_avg'], "arrivalQuantity": data['arrival'],
         "updateDate": data['date'], "yesterdayDate": data['prev_date'],
         "isRainExpected": is_rain, "weatherAlert": alert, "marketImpact": impact,
-        "cropImpactIndex": "स्थिर", "predictedMinPrice": data['avg']*0.95, "predictedMaxPrice": data['avg']*1.10
+        "cropImpactIndex": "स्थिर", "predictedMinPrice": data['avg']*0.95, "predictedMaxPrice": data['avg']*1.10,
+        "predictionNote": "बाजार भाव आधारित अनुमान"
     }
 
 @app.get("/api/mandipulse/dashboard")
 def get_dashboard(commodity: str = Query(...), state: str = Query(...), city: str = Query(...)):
     data = get_mandi_data(commodity, state, city)
     is_rain, impact, alert = get_weather_risk(city)
-    if not data: return {"appName": "MandiPulse 💓", "commodity": commodity, "currentPrice": 0.0}
+
+    empty_bechain = {"signal": "NONE", "signalHindi": "डेटा नहीं ⚪", "score": 0, "advice": "सरकारी डेटा अपडेट नहीं हुआ है।"}
+    empty_calendar = {"bestMonth": "N/A", "bestPrice": 0.0, "worstMonth": "N/A", "sellAdvice": "Hold"}
+    empty_heatmap = {"hottestMandi": city, "top3": []}
+
+    if not data:
+        return {
+            "appName": "MandiPulse 💓", "tagline": "Live accurate data", "commodity": commodity, "location": city,
+            "currentPrice": 0.0, "maxPrice": 0.0, "minPrice": 0.0, "yesterdayPrice": 0.0, "arrivalQty": 0,
+            "updateDate": "N/A", "yesterdayDate": "N/A", "bechainIndex": empty_bechain,
+            "fasalCalendar": empty_calendar, "mandiHeatMap": empty_heatmap, "weather": {"isRain": is_rain, "alert": alert, "impact": impact}
+        }
+
     return {
         "appName": "MandiPulse 💓", "commodity": commodity, "location": city,
         "currentPrice": data['avg'], "maxPrice": data['max'], "minPrice": data['min'],
@@ -128,12 +161,12 @@ def calculate_mandipulse(commodity: str = Query(...), state: str = Query(...), c
     avg = data['avg'] if data else 5000.0
     return {
         "commodityHindi": HINDI_COMMODITY.get(commodity, commodity), "location": city, "currentPrice": avg,
-        "masterScore": 75, "masterHindi": "मजबूत भाव", "masterColor": "green", "masterAdvice": "रोको — लाभ होगा",
+        "masterScore": 75, "masterSignal": "HOLD", "masterHindi": "मजबूत भाव", "masterColor": "green", "masterAdvice": "रोको — लाभ होगा",
         "demandSupply": {"supplyLevel": "सामान्य", "supplyHindi": "आवक स्थिर", "supplyScore": 50, "demandScore": 70, "netHindi": "माँग > आपूर्ति", "netColor": "green", "chartValue": 60},
-        "pricePrediction": {"months": [{"monthName": "अक्टूबर", "predictedAvg": avg*1.05, "direction": "↑", "dirColor": "green"}]},
-        "bechainIndex": {"score": 65, "signalHindi": "रुको 🟡", "reason": "तेजी संभव"},
-        "mspCalculator": {"mspValue": MSP_2025_26.get(commodity, 0), "currentPrice": avg, "hindi": "MSP के करीब", "advice": "रुको"},
-        "weatherImpact": {"isRain": is_rain, "impactHindi": alert, "advice": "सावधानी रखें"}
+        "pricePrediction": {"months": [{"monthName": "अक्टूबर", "predictedAvg": int(avg*1.05), "direction": "↑", "dirColor": "green", "predictedMin": int(avg*0.95), "predictedMax": int(avg*1.15), "reason": "मौसमी", "changeFromNow": "5%"}]},
+        "bechainIndex": {"score": 65, "signalHindi": "रुको 🟡", "reason": "तेजी संभव", "signalColor": "yellow", "advice": "इंतजार करें"},
+        "mspCalculator": {"mspValue": MSP_2025_26.get(commodity, 0), "currentPrice": avg, "hindi": "MSP के करीब", "advice": "रुको", "color": "yellow", "action": "इंतजार"},
+        "weatherImpact": {"isRain": is_rain, "impactHindi": alert, "advice": "सावधानी रखें", "impactScore": 50, "impactColor": "yellow", "priceImpact": "5%", "timeline": "7 दिन", "alert": alert, "isRain": is_rain, "sensitivityHindi": "मध्यम"}
     }
 
 # ============================================================
@@ -153,4 +186,4 @@ def add_listing(data: dict):
     return {"status": "success", "listingId": "L001"}
 
 @app.get("/")
-def root(): return {"status": "MandiPulse v2.19.0 Online"}
+def root(): return {"status": "MandiPulse v2.20.0 Online"}
