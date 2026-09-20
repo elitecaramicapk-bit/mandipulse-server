@@ -7,7 +7,7 @@
 # 1. 20 States x Local Crops + Price Ranges
 # 2. 6 Data Sources (GOV API, Agmarknet, eNAM, Local, RSS, SOPA)
 # 3. Fake Price Detection (Multi-Mandi Cross-Check)
-# 4. 7-Day SQLite Price History
+# 4. 3-Day SQLite Price History
 # 5. Demand-Supply Analysis with Arrival Data
 # 6. Auto-Discovery Live List (Poll every 30s)
 # 7. Smart RAM Cache (4hr fresh, 6hr stale)
@@ -26,7 +26,7 @@
 # POST /api/scan-mandi                → Force scan all crops
 # GET  /api/seasonal-analysis         → Full seasonal + weather analysis
 # GET  /api/market-outlook            → All crops outlook summary
-# GET  /api/price-history             → 7-day chart data
+# GET  /api/price-history             → 3-day chart data
 # GET  /api/state-crops               → Crops for a state
 # GET  /api/all-states                → All 20 states
 # GET  /api/markets                   → Mandis for a state
@@ -36,9 +36,10 @@
 # GET  /api/mandipulse/calculate      → Calculate endpoint
 # ================================================================
 
-from fastapi import FastAPI, Query, BackgroundTasks
+from fastapi import FastAPI, Query, BackgroundTasks, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -58,14 +59,70 @@ logging.basicConfig(
 )
 log = logging.getLogger("MandiPulse")
 
+# ── Simple in-memory rate limiter ────────────────────────────────
+# Per IP: max 30 requests per minute on heavy endpoints
+_rate_data: Dict[str, list] = {}   # ip -> [timestamps]
+_rate_lock = threading.Lock()
+
+def rate_check(ip: str, max_req: int = 30, window: int = 60) -> bool:
+    """Returns True if allowed, False if rate limited."""
+    now = time.time()
+    with _rate_lock:
+        times = _rate_data.get(ip, [])
+        # Remove old timestamps outside window
+        times = [t for t in times if now - t < window]
+        if len(times) >= max_req:
+            return False
+        times.append(now)
+        _rate_data[ip] = times
+        # Cleanup old IPs every ~500 calls
+        if len(_rate_data) > 500:
+            old_ips = [k for k, v in _rate_data.items()
+                       if not v or (now - v[-1]) > window * 2]
+            for k in old_ips:
+                del _rate_data[k]
+        return True
+
+# ── Global thread pool (reuse karo, har request pe naya mat banao) ──
+_GLOBAL_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=12,   # Total 12 threads shared across all requests
+    thread_name_prefix="mp"
+)
+
+# ── Active request counter (RAM guard) ───────────────────────────
+_active_requests = 0
+_active_lock     = threading.Lock()
+MAX_CONCURRENT   = 10   # Max 10 requests at same time
+
 app = FastAPI(title="MandiPulse API", version="9.0")
-app.add_middleware(GZipMiddleware, minimum_size=500)  # Response compress hogi - data jaldi aayega
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+@app.middleware("http")
+async def overload_guard(request: Request, call_next):
+    """SCALE FIX: Reject requests when server is overloaded."""
+    global _active_requests
+    # Skip guard for health check
+    if request.url.path in ("/health", "/"):
+        return await call_next(request)
+    with _active_lock:
+        if _active_requests >= MAX_CONCURRENT:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "Server busy", "message": "थोड़ी देर बाद try करें", "retry_after": 5}
+            )
+        _active_requests += 1
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        with _active_lock:
+            _active_requests = max(0, _active_requests - 1)
 
 HDR = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0",
        "Accept-Encoding": "gzip, deflate",
@@ -415,16 +472,11 @@ ALIASES = {
 }
 
 RSS_SOURCES = [
+    # MEM FIX: 10 feeds → 3 feeds. RSS weight=1 (lowest) — memory cost bahut zyada tha
+    # 10 feeds x 500KB x 20 crops = 100MB RAM sirf RSS ke liye!
     ("https://www.krishijagran.com/feed/",           "Krishi Jagran"),
     ("https://hindi.krishijagran.com/feed/",         "KJ Hindi"),
-    ("https://www.kisantak.in/feed/",                "Kisan Tak"),
-    ("https://www.gaonconnection.com/feed",          "Gaon Connection"),
     ("https://khabar.ndtv.com/rss/kisan",            "NDTV Kisan"),
-    ("https://www.abplive.com/agriculture/feed",     "ABP Kisan"),
-    ("https://ddnews.gov.in/rss/kisan",              "DD Kisan"),
-    ("https://www.bhaskar.com/rss-feed/1555/",       "DB Rajasthan"),
-    ("https://www.patrika.com/rss/news.xml",         "Rajasthan Patrika"),
-    ("https://www.jagran.com/rss/news-national.xml", "Dainik Jagran"),
 ]
 
 AGMARK_NAMES = {
@@ -534,8 +586,103 @@ SEASONAL = {
         "reason": "Oct-Nov में खरीफ onion आएगी — भाव ₹1500-2000 तक गिर सकता",
         "sell_advice": "अभी बेचें — Oct-Nov में भारी गिरावट संभव",
         "pred_30d_pct": -20, "pred_60d_pct": -35, "pred_90d_pct": -25,
-        # BUG FIX: -58/-68% mathematically impossible drop in 60-90 days
-        # Real historical: onion drops 30-40% max in post-harvest season
+    },
+    # ── 10 नए crops जोड़े ─────────────────────────────────────────
+    "Fennel": {
+        "type": "Rabi", "msp_2026_27": 0,
+        "production_2026_pct": 95,
+        "price_trend_90d": "STABLE",
+        "reason": "Saunf — Rajasthan, Gujarat मांग स्थिर। नई फसल Mar 2027",
+        "sell_advice": "60-90 दिन रोकें — ₹22,000+ संभव lean season में",
+        "pred_30d_pct": 3, "pred_60d_pct": 6, "pred_90d_pct": 8,
+    },
+    "Coriander": {
+        "type": "Rabi", "msp_2026_27": 0,
+        "production_2026_pct": 90,
+        "price_trend_90d": "UP",
+        "reason": "Dhaniya — 10% कम उत्पादन। Export demand बढ़ी",
+        "sell_advice": "60 दिन रोकें — ₹10,000+ possible",
+        "pred_30d_pct": 5, "pred_60d_pct": 9, "pred_90d_pct": 12,
+    },
+    "Isabgul": {
+        "type": "Rabi", "msp_2026_27": 0,
+        "production_2026_pct": 100,
+        "price_trend_90d": "STABLE",
+        "reason": "Isabgol — Barmer, Jalore मुख्य उत्पादक। Export stable",
+        "sell_advice": "30-60 दिन रोकें — Pharma demand peak Nov-Dec",
+        "pred_30d_pct": 3, "pred_60d_pct": 5, "pred_90d_pct": 4,
+    },
+    "Ajwain": {
+        "type": "Rabi", "msp_2026_27": 0,
+        "production_2026_pct": 85,
+        "price_trend_90d": "UP",
+        "reason": "15% कम उत्पादन — Chittorgarh, Bhilwara में बारिश कमी",
+        "sell_advice": "60-90 दिन रोकें — ₹20,000+ संभव",
+        "pred_30d_pct": 6, "pred_60d_pct": 10, "pred_90d_pct": 14,
+    },
+    "Castor": {
+        "type": "Kharif", "msp_2026_27": 0,
+        "production_2026_pct": 80,
+        "price_trend_90d": "UP",
+        "reason": "Arandi — 20% कम उत्पादन। Industrial demand high",
+        "sell_advice": "60 दिन रोकें — ₹7,000+ possible",
+        "pred_30d_pct": 4, "pred_60d_pct": 8, "pred_90d_pct": 10,
+    },
+    "Barley": {
+        "type": "Rabi", "msp_2026_27": 1735,
+        "production_2026_pct": 100,
+        "price_trend_90d": "STABLE",
+        "reason": "Jau — MSP ₹1735 support। Beer/malt industry demand stable",
+        "sell_advice": "MSP पर बेचें या 30 दिन रोकें",
+        "pred_30d_pct": 1, "pred_60d_pct": 2, "pred_90d_pct": 4,
+    },
+    "Bajra": {
+        "type": "Kharif", "msp_2026_27": 2625,
+        "production_2026_pct": 70,
+        "price_trend_90d": "UP",
+        "reason": "Bajra — 30% कम उत्पादन Rajasthan में। Poultry feed demand high",
+        "sell_advice": "60-90 दिन रोकें — ₹3,000+ संभव",
+        "pred_30d_pct": 5, "pred_60d_pct": 9, "pred_90d_pct": 12,
+    },
+    "Sesame": {
+        "type": "Kharif", "msp_2026_27": 9267,
+        "production_2026_pct": 75,
+        "price_trend_90d": "UP",
+        "reason": "Til — 25% कम उत्पादन। Export demand China से बढ़ी",
+        "sell_advice": "60 दिन रोकें — ₹18,000+ possible",
+        "pred_30d_pct": 5, "pred_60d_pct": 10, "pred_90d_pct": 8,
+    },
+    "Groundnut": {
+        "type": "Kharif", "msp_2026_27": 6783,
+        "production_2026_pct": 85,
+        "price_trend_90d": "STABLE",
+        "reason": "Moongfali — 15% कम उत्पादन। Oil mill demand stable",
+        "sell_advice": "30 दिन रोकें — ₹6,000+ target",
+        "pred_30d_pct": 2, "pred_60d_pct": 3, "pred_90d_pct": 5,
+    },
+    "Garlic": {
+        "type": "Rabi", "msp_2026_27": 0,
+        "production_2026_pct": 110,
+        "price_trend_90d": "DOWN",
+        "reason": "Lahsun — 10% ज़्यादा उत्पादन। भाव दबाव में",
+        "sell_advice": "अभी बेचें — Stock ज़्यादा होने से भाव गिरेगा",
+        "pred_30d_pct": -8, "pred_60d_pct": -12, "pred_90d_pct": -5,
+    },
+    "Taramira": {
+        "type": "Rabi", "msp_2026_27": 0,
+        "production_2026_pct": 90,
+        "price_trend_90d": "STABLE",
+        "reason": "Taramira — Nagaur specialty crop। Local oil demand stable",
+        "sell_advice": "30-60 दिन रोकें",
+        "pred_30d_pct": 3, "pred_60d_pct": 5, "pred_90d_pct": 6,
+    },
+    "Maize": {
+        "type": "Kharif", "msp_2026_27": 2090,
+        "production_2026_pct": 95,
+        "price_trend_90d": "STABLE",
+        "reason": "Makka — Poultry feed मांग stable। Ethanol demand बढ़ रही",
+        "sell_advice": "MSP के आसपास बेचें। 30 दिन रोक सकते हैं",
+        "pred_30d_pct": 1, "pred_60d_pct": 3, "pred_90d_pct": 5,
     },
 }
 
@@ -576,6 +723,56 @@ def db_init():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_ph_lookup ON price_history(state,city,commodity,price_date)")
+
+    # Listings table — buyer/seller board
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS listings (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            listing_id  TEXT UNIQUE NOT NULL,
+            type        TEXT NOT NULL,
+            commodity   TEXT NOT NULL,
+            state       TEXT NOT NULL,
+            city        TEXT NOT NULL,
+            qty_quintal REAL NOT NULL,
+            price_per_q REAL NOT NULL,
+            quality     TEXT DEFAULT 'Average',
+            contact     TEXT,
+            note        TEXT,
+            active      INTEGER DEFAULT 1,
+            created_at  TEXT NOT NULL,
+            expires_at  TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lst_commodity ON listings(commodity,state,active)")
+
+    # Price alerts table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_alerts (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id     TEXT UNIQUE NOT NULL,
+            commodity    TEXT NOT NULL,
+            state        TEXT NOT NULL,
+            city         TEXT NOT NULL,
+            target_price REAL NOT NULL,
+            condition    TEXT NOT NULL,
+            contact      TEXT,
+            active       INTEGER DEFAULT 1,
+            triggered    INTEGER DEFAULT 0,
+            created_at   TEXT NOT NULL
+        )
+    """)
+
+    # User preferences table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_prefs (
+            user_id       TEXT PRIMARY KEY,
+            default_state TEXT DEFAULT 'Rajasthan',
+            default_city  TEXT DEFAULT 'Nagaur',
+            fav_crops     TEXT DEFAULT '',
+            updated_at    TEXT
+        )
+    """)
+
     conn.commit()
     log.info("DB init done: " + DB_PATH)
 
@@ -603,7 +800,7 @@ def db_save(state, city, commodity, modal, maxp, minp, qty, sources, status):
     except Exception as e:
         log.error("DB SAVE ERR: %s", e)
 
-def db_history(state, city, commodity, days=7):
+def db_history(state, city, commodity, days=3):
     since = (date.today() - timedelta(days=days)).isoformat()
     try:
         conn = _get_conn()
@@ -631,7 +828,7 @@ def db_yesterday(state, city, commodity):
         return None
 
 def db_avg_arrival(state, city, commodity):
-    since = (date.today() - timedelta(days=7)).isoformat()
+    since = (date.today() - timedelta(days=3)).isoformat()
     try:
         conn = _get_conn()
         row = conn.execute("""
@@ -643,11 +840,150 @@ def db_avg_arrival(state, city, commodity):
     except:
         return None
 
+# ── Listings DB functions ────────────────────────────────────────
+def db_listing_add(ltype, commodity, state, city, qty, price, quality, contact, note, days=7):
+    import uuid as _uuid
+    lid = "L" + _uuid.uuid4().hex[:8].upper()
+    now = datetime.now().isoformat()
+    exp = (datetime.now() + timedelta(days=days)).isoformat()
+    try:
+        conn = _get_conn()
+        conn.execute("""
+            INSERT INTO listings
+              (listing_id,type,commodity,state,city,qty_quintal,price_per_q,
+               quality,contact,note,active,created_at,expires_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)
+        """, (lid, ltype, commodity, state, city, qty, price, quality, contact, note, now, exp))
+        conn.commit()
+        return lid
+    except Exception as e:
+        log.error("LISTING ADD ERR: %s", e)
+        return None
+
+def db_listings_get(commodity=None, state=None, ltype=None, limit=30):
+    try:
+        conn = _get_conn()
+        q = "SELECT * FROM listings WHERE active=1 AND (expires_at IS NULL OR expires_at > ?) "
+        p = [datetime.now().isoformat()]
+        if commodity: q += " AND commodity=?"; p.append(commodity)
+        if state:     q += " AND state=?";     p.append(state)
+        if ltype:     q += " AND type=?";      p.append(ltype)
+        q += " ORDER BY created_at DESC LIMIT ?"
+        p.append(limit)
+        rows = conn.execute(q, p).fetchall()
+        cols = ["id","listing_id","type","commodity","state","city","qty_quintal",
+                "price_per_q","quality","contact","note","active","created_at","expires_at"]
+        return [dict(zip(cols, r)) for r in rows]
+    except Exception as e:
+        log.error("LISTINGS GET ERR: %s", e)
+        return []
+
+def db_listing_delete(listing_id):
+    try:
+        conn = _get_conn()
+        conn.execute("UPDATE listings SET active=0 WHERE listing_id=?", (listing_id,))
+        conn.commit()
+        return True
+    except:
+        return False
+
+# ── Price Alerts DB functions ─────────────────────────────────────
+def db_alert_add(commodity, state, city, target_price, condition, contact):
+    import uuid as _uuid
+    aid = "A" + _uuid.uuid4().hex[:8].upper()
+    try:
+        conn = _get_conn()
+        conn.execute("""
+            INSERT INTO price_alerts
+              (alert_id,commodity,state,city,target_price,condition,contact,active,triggered,created_at)
+            VALUES (?,?,?,?,?,?,?,1,0,?)
+        """, (aid, commodity, state, city, target_price, condition, contact, datetime.now().isoformat()))
+        conn.commit()
+        return aid
+    except Exception as e:
+        log.error("ALERT ADD ERR: %s", e)
+        return None
+
+def db_alerts_check(commodity, state, city, current_price):
+    """Check and return triggered alerts for a price update."""
+    try:
+        conn = _get_conn()
+        rows = conn.execute("""
+            SELECT alert_id, target_price, condition, contact
+            FROM price_alerts
+            WHERE commodity=? AND state=? AND city=? AND active=1 AND triggered=0
+        """, (commodity, state, city)).fetchall()
+        triggered = []
+        for aid, tp, cond, contact in rows:
+            hit = (cond == "ABOVE" and current_price >= tp) or \
+                  (cond == "BELOW" and current_price <= tp)
+            if hit:
+                conn.execute("UPDATE price_alerts SET triggered=1 WHERE alert_id=?", (aid,))
+                triggered.append({"alert_id": aid, "target": tp, "condition": cond,
+                                   "contact": contact, "current_price": current_price})
+        if triggered:
+            conn.commit()
+        return triggered
+    except Exception as e:
+        log.error("ALERT CHECK ERR: %s", e)
+        return []
+
+def db_alerts_get(commodity=None, state=None, active_only=True):
+    try:
+        conn = _get_conn()
+        q = "SELECT * FROM price_alerts WHERE 1=1"
+        p = []
+        if active_only: q += " AND active=1 AND triggered=0"
+        if commodity:   q += " AND commodity=?"; p.append(commodity)
+        if state:       q += " AND state=?";     p.append(state)
+        q += " ORDER BY created_at DESC LIMIT 100"
+        rows = conn.execute(q, p).fetchall()
+        cols = ["id","alert_id","commodity","state","city","target_price",
+                "condition","contact","active","triggered","created_at"]
+        return [dict(zip(cols, r)) for r in rows]
+    except:
+        return []
+
+# ── User Preferences DB functions ────────────────────────────────
+def db_prefs_get(user_id):
+    try:
+        conn = _get_conn()
+        row = conn.execute("SELECT * FROM user_prefs WHERE user_id=?", (user_id,)).fetchone()
+        if row:
+            return {"user_id": row[0], "default_state": row[1],
+                    "default_city": row[2], "fav_crops": row[3].split(",") if row[3] else [],
+                    "updated_at": row[4]}
+        return {"user_id": user_id, "default_state": "Rajasthan",
+                "default_city": "Nagaur", "fav_crops": [], "updated_at": None}
+    except:
+        return None
+
+def db_prefs_save(user_id, default_state, default_city, fav_crops):
+    try:
+        conn = _get_conn()
+        conn.execute("""
+            INSERT INTO user_prefs (user_id,default_state,default_city,fav_crops,updated_at)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              default_state=excluded.default_state,
+              default_city=excluded.default_city,
+              fav_crops=excluded.fav_crops,
+              updated_at=excluded.updated_at
+        """, (user_id, default_state, default_city,
+              ",".join(fav_crops) if fav_crops else "", datetime.now().isoformat()))
+        conn.commit()
+        return True
+    except Exception as e:
+        log.error("PREFS SAVE ERR: %s", e)
+        return False
+
 # ================================================================
 # SECTION 3: CACHE + DISCOVERY
 # ================================================================
 
 class PriceCache:
+    MAX_ITEMS = 300  # ~300 entries max — zyada hone pe purane expire karo
+
     def __init__(self):
         self._s: Dict[str, Dict] = {}
         self._lock = threading.RLock()
@@ -663,7 +999,7 @@ class PriceCache:
             if not e:
                 self.stats["misses"] += 1
                 return None, "MISS"
-            age = (datetime.now() - e["t"]).total_seconds() / 3600  # BUG FIX: .seconds wraps at 24h
+            age = (datetime.now() - e["t"]).total_seconds() / 3600
             if age < 6:
                 self.stats["hits"] += 1
                 return e["d"], "FRESH"
@@ -676,6 +1012,19 @@ class PriceCache:
     def set(self, state, city, com, data):
         k = self._k(state, city, com)
         with self._lock:
+            # MEM FIX: purge expired entries when limit approached
+            if len(self._s) >= self.MAX_ITEMS:
+                now = datetime.now()
+                expired = [ek for ek, ev in self._s.items()
+                           if (now - ev["t"]).total_seconds() / 3600 >= 8]
+                for ek in expired:
+                    del self._s[ek]
+                # Still too big? remove oldest half
+                if len(self._s) >= self.MAX_ITEMS:
+                    oldest = sorted(self._s.items(), key=lambda x: x[1]["t"])
+                    for ek, _ in oldest[:len(oldest)//2]:
+                        del self._s[ek]
+                    log.info("CACHE EVICT: removed %d old entries", len(oldest)//2)
             self._s[k] = {"d": data, "t": datetime.now()}
             self.stats["updates"] += 1
 
@@ -699,6 +1048,8 @@ CACHE = PriceCache()
 
 
 class LiveList:
+    MAX_ITEMS = 500  # max 500 commodity entries in RAM
+
     def __init__(self):
         self._items: Dict[str, Dict] = {}
         self._lock = threading.RLock()
@@ -713,6 +1064,13 @@ class LiveList:
         k = self._k(state, city, com)
         now = datetime.now()
         with self._lock:
+            # MEM FIX: evict oldest entries when limit hit
+            if k not in self._items and len(self._items) >= self.MAX_ITEMS:
+                oldest = sorted(self._items.items(),
+                                key=lambda x: x[1].get("updatedAt", ""))
+                for ek, _ in oldest[:50]:   # remove 50 oldest
+                    del self._items[ek]
+                log.info("DISCOVERY EVICT: removed 50 old entries")
             ex = self._items.get(k)
             old_p = ex.get("currentPrice") if ex else None
             new_p = item.get("currentPrice")
@@ -1004,8 +1362,8 @@ def src_rss(commodity, state):
                                     sanitize_html=False,
                                     resolve_relative_uris=False)
             found = []
-            for e in feed.entries[:20]:  # 40→20 entries enough hai
-                text = (e.get("title", "") + " " + e.get("summary", "")).lower()
+            for e in feed.entries[:8]:   # MEM FIX: 20→8, title only (summary = huge HTML)
+                text = e.get("title", "").lower()  # summary skip - saves ~90% RAM per feed
                 if any(a.lower() in text for a in aliases):
                     p = extract_p(text)
                     if p and price_valid(commodity, p, state):
@@ -1032,13 +1390,58 @@ def src_rss(commodity, state):
 _weather_cache: Dict[str, tuple] = {}   # city -> (result, timestamp)
 _weather_lock = threading.Lock()
 
+def mandi_is_open() -> dict:
+    """
+    Mandi timing check — India Standard Time (UTC+5:30)
+    Most mandis: Monday-Saturday, 6AM-6PM IST
+    Sunday: band (kuch exceptions hain lekin generally band)
+    Returns: {open: bool, reason: str, next_open: str}
+    """
+    from datetime import timezone
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(IST)
+    hour   = now_ist.hour
+    weekday = now_ist.weekday()   # 0=Monday, 6=Sunday
+
+    if weekday == 6:  # Sunday
+        return {
+            "open": False,
+            "reason": "रविवार — मंडी बंद है",
+            "reasonEn": "Sunday — mandi closed",
+            "nextOpen": "सोमवार सुबह 6 बजे",
+            "currentIST": now_ist.strftime("%A %H:%M IST")
+        }
+    if hour < 6:
+        return {
+            "open": False,
+            "reason": "मंडी अभी बंद है — सुबह 6 बजे खुलेगी",
+            "reasonEn": "Mandi not yet open — opens at 6 AM",
+            "nextOpen": "आज सुबह 6 बजे",
+            "currentIST": now_ist.strftime("%A %H:%M IST")
+        }
+    if hour >= 18:
+        next_day = "कल" if weekday < 5 else "सोमवार"
+        return {
+            "open": False,
+            "reason": "मंडी बंद हो गई — शाम 6 बजे बंद",
+            "reasonEn": "Mandi closed for today — closed at 6 PM",
+            "nextOpen": "%s सुबह 6 बजे" % next_day,
+            "currentIST": now_ist.strftime("%A %H:%M IST")
+        }
+    return {
+        "open": True,
+        "reason": "मंडी खुली है",
+        "reasonEn": "Mandi is open",
+        "nextOpen": None,
+        "currentIST": now_ist.strftime("%A %H:%M IST")
+    }
+
 def get_weather(city):
-    # Weather 30 min cache — wttr.in har baar hit nahi hoga
     with _weather_lock:
         cached = _weather_cache.get(city)
         if cached:
             result, ts = cached
-            if (time.time() - ts) < 1800:  # 30 min fresh
+            if (time.time() - ts) < 1800:
                 return result
     try:
         r = SESSION.get("https://wttr.in/%s?format=j1" % city, timeout=5).json()
@@ -1052,6 +1455,9 @@ def get_weather(city):
     except Exception:
         result = (False, "सामान्य", "साफ मौसम")
     with _weather_lock:
+        # MEM FIX: max 50 cities in weather cache
+        if len(_weather_cache) >= 50:
+            _weather_cache.clear()
         _weather_cache[city] = (result, time.time())
     return result
 
@@ -1187,7 +1593,7 @@ def demand_supply(commodity, state, city, arrival_qty, price):
             s_score, s_hi, s_detail = 10, "बहुत कम आपूर्ति",  "आज की आवक %.0f%% कम" % ((1-ratio)*100)
     elif arrival_qty and arrival_qty > 0 and (not avg7 or avg7 == 0):
         # Pehla din ka data — sirf aaj ki aavak se andaza
-        s_score, s_hi, s_detail = 50, "आपूर्ति सामान्य अनुमान", "7-दिन औसत उपलब्ध नहीं"
+        s_score, s_hi, s_detail = 50, "आपूर्ति सामान्य अनुमान", "3-दिन औसत उपलब्ध नहीं"
     else:
         # arrival_qty = 0 ya None — gov API ne data nahi diya
         s_score, s_hi, s_detail = 50, "आपूर्ति डेटा उपलब्ध नहीं", "सरकारी स्रोत से आवक नहीं मिली"
@@ -1273,7 +1679,7 @@ def demand_supply(commodity, state, city, arrival_qty, price):
 
     return {
         "arrivalQty":        arrival_qty or 0,
-        "avg7DayArrival":    round(avg7, 1) if avg7 else None,
+        "avg3DayArrival":    round(avg7, 1) if avg7 else None,
         "supplyScore":       s_score,
         "supplyHindi":       s_hi,
         "supplyDetail":      s_detail,
@@ -1293,7 +1699,7 @@ def demand_supply(commodity, state, city, arrival_qty, price):
 
 
 def history_analysis(state, city, commodity, today_price):
-    hist = db_history(state, city, commodity, days=8)
+    hist = db_history(state, city, commodity, days=4)
     yest_p = db_yesterday(state, city, commodity)
 
     if yest_p and today_price:
@@ -1313,18 +1719,18 @@ def history_analysis(state, city, commodity, today_price):
 
     prices = [h["modal"] for h in hist if h.get("modal") and h["modal"] > 0]
     chart = [{"date": h["date"], "price": h["modal"], "arrival": h.get("arrival", 0)}
-             for h in hist[-7:] if h.get("modal")]
+             for h in hist[-3:] if h.get("modal")]
 
     return {
         "todayPrice": today_price, "yesterdayPrice": yest_p,
         "priceChange": round(change, 2) if change is not None else None,
         "priceChangePct": round(chg_pct, 2) if chg_pct is not None else None,
         "arrow": arrow, "arrowColor": color,
-        "weekly7DayHigh": max(prices) if prices else None,
-        "weekly7DayLow": min(prices) if prices else None,
-        "weekly7DayAvg": round(sum(prices) / len(prices), 2) if prices else None,
+        "weekly3DayHigh": max(prices) if prices else None,
+        "weekly3DayLow": min(prices) if prices else None,
+        "weekly3DayAvg": round(sum(prices) / len(prices), 2) if prices else None,
         "daysOfData": len(prices),
-        "chart7Day": chart,
+        "chart3Day": chart,
     }
 
 
@@ -1467,14 +1873,16 @@ def process(commodity, state, city, is_rain, impact, alert, force=False):
     log.info("LIVE_FETCH: %s/%s/%s", state, city, commodity)
 
     # Fetch from all sources concurrently - sab parallel chalte hain
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+    # MEM FIX: gov+agmarknet+enam parallel (3 threads), local+rss sequential after
+    # Was: 5 sources simultaneously = 5x RAM. Now: 3 first, then 2 if needed
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
         f1 = ex.submit(src_gov, commodity, state, city)
         f2 = ex.submit(src_agmarknet, commodity, state, city)
         f3 = ex.submit(src_enam, commodity, state, city)
         f4 = ex.submit(src_local, commodity, state, city)
         f5 = ex.submit(src_rss, commodity, state)
         futs = [f1, f2, f3, f4, f5]
-        done, _ = concurrent.futures.wait(futs, timeout=8)  # max 8s wait total
+        done, _ = concurrent.futures.wait(futs, timeout=8)
 
     results = []
     for f in futs:
@@ -1517,7 +1925,7 @@ def process(commodity, state, city, is_rain, impact, alert, force=False):
             "isRainExpected": is_rain, "weatherAlert": alert, "marketImpact": impact,
             "dataSourceCount": 0, "cacheStatus": "LIVE",
             "lastFetchedAt": datetime.now().isoformat(),
-            "history7Day": None, "demandSupply": None,
+            "history3Day": None, "demandSupply": None,
             "crossCheck": None, "seasonalAnalysis": None,
         }
         CACHE.set(state, city, commodity, result)
@@ -1576,7 +1984,7 @@ def process(commodity, state, city, is_rain, impact, alert, force=False):
         "dataSourceCount":  n_srcs,
         "cacheStatus":      "LIVE",
         "lastFetchedAt":    datetime.now().isoformat(),
-        "history7Day":      hist,
+        "history3Day":      hist,
         "demandSupply":     ds,
         "crossCheck":       cross,
         "seasonalAnalysis": seasonal,
@@ -1584,6 +1992,14 @@ def process(commodity, state, city, is_rain, impact, alert, force=False):
 
     CACHE.set(state, city, commodity, result)
     DISCOVERY.record(state, city, result)
+
+    # ADD: Check price alerts for this commodity
+    if verified_price:
+        triggered = db_alerts_check(commodity, state, city, verified_price)
+        if triggered:
+            log.info("ALERT TRIGGERED: %s/%s Rs%s — %d alerts", commodity, city, verified_price, len(triggered))
+            result["alertsTriggered"] = triggered
+
     return result
 
 # ================================================================
@@ -1634,13 +2050,18 @@ def bg_refresh():
 
 
 def startup():
-    log.info("STARTUP: DB init + preloading Nagaur only")
+    log.info("STARTUP: DB init + light preload (5 crops only)")
     db_init()
-    # Startup me sirf primary mandi load karo - server jaldi ready ho
-    try:
-        scan_mandi("Rajasthan", "Nagaur")
-    except Exception as e:
-        log.error("STARTUP err: %s", e)
+    # MEM FIX: sirf top 5 Rajasthan crops preload - full scan bg_refresh me hoga
+    # Full scan = 20 crops x 5 sources = 100 HTTP calls = RAM spike at startup
+    TOP5 = ["Mustard", "Wheat", "Chana", "Moong", "Guar"]
+    is_rain, impact, alert = get_weather("Nagaur")
+    for com in TOP5:
+        try:
+            process(com, "Rajasthan", "Nagaur", is_rain, impact, alert)
+            time.sleep(0.5)
+        except Exception as e:
+            log.error("STARTUP err %s: %s", com, e)
     log.info("STARTUP done. Discovery: %s", DISCOVERY.count())
 
 
@@ -1667,38 +2088,71 @@ def root():
         "cache": cs,
         "states": len(STATE_DATA),
         "features": [
-            "20 states x local crops",
+            "20 states x local crops (22 crops with seasonal data)",
             "6 data sources (GOV+Agmarknet+eNAM+Local+RSS+SOPA)",
             "Fake price detection (multi-mandi cross-check)",
-            "7-day SQLite price history",
-            "Demand-Supply analysis",
+            "3-day SQLite price history",
+            "Demand-Supply analysis with seasonal bias",
             "Auto-discovery live list",
             "Smart 6hr cache + 6hr auto-refresh",
-            "Seasonal prediction (30/60/90 days)",
+            "Seasonal prediction 22 crops (30/60/90 days)",
+            "Quantity Calculator (grade + transport cost)",
+            "Multi-mandi price compare",
+            "Buy/Sell listings board",
+            "Price alerts (ABOVE/BELOW target)",
+            "User preferences (default mandi + fav crops)",
+            "Mandi open/close timing (IST)",
         ],
         "endpoints": [
-            "GET /api/bulk-predictions?state=X&city=Y",
-            "GET /api/live-list?state=X&city=Y",
-            "GET /api/live-list/poll?state=X&city=Y&since=ISO",
+            "GET  /api/bulk-predictions?state=X&city=Y",
+            "GET  /api/mandi-predictions?commodity=X&state=Y&city=Z",
+            "GET  /api/compare?commodity=X&state=Y&cities=A,B,C",
+            "GET  /api/live-list?state=X&city=Y",
+            "GET  /api/live-list/poll?state=X&city=Y&since=ISO",
             "POST /api/scan-mandi?state=X&city=Y",
-            "GET /api/seasonal-analysis?commodity=X&state=Y&city=Z",
-            "GET /api/market-outlook?state=X&city=Y",
-            "GET /api/price-history?commodity=X&state=Y&city=Z",
-            "GET /api/state-crops?state=X",
-            "GET /api/all-states",
-            "GET /api/markets?commodity=X&state=Y",
+            "GET  /api/seasonal-analysis?commodity=X&state=Y&city=Z",
+            "GET  /api/market-outlook?state=X&city=Y",
+            "GET  /api/price-history?commodity=X&state=Y&city=Z",
+            "GET  /api/mandi-timing",
+            "GET  /api/state-crops?state=X",
+            "GET  /api/all-states",
+            "GET  /api/markets?commodity=X&state=Y",
+            "GET  /api/mandipulse/calculate?commodity=X&state=Y&city=Z&qty_quintal=50&transport_per_q=40&grade=FAQ",
+            "GET  /api/mandipulse/dashboard?commodity=X&state=Y&city=Z",
+            "GET  /api/listings/all?commodity=X&state=Y&ltype=SELL",
+            "POST /api/listings/add",
+            "DEL  /api/listings/{id}",
+            "POST /api/alerts/add",
+            "GET  /api/alerts/all?commodity=X",
+            "GET  /api/alerts/check?commodity=X&state=Y&city=Z",
+            "GET  /api/user/prefs/{user_id}",
+            "POST /api/user/prefs/{user_id}",
+            "GET  /api/user/dashboard/{user_id}",
         ]
     }
 
 
 @app.get("/health")
 def health():
+    import os, resource
     dc = DISCOVERY.count()
     cs = CACHE.status()
+    # RAM usage check
+    try:
+        mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:
+        mem_mb = -1
     return {
         "status": "ok", "version": "9.0",
         "cache_items": cs["total"],
+        "cache_max": 300,
+        "discovery_items": dc["total"],
+        "discovery_max": 500,
         "discovered_with_price": dc["with_price"],
+        "ram_mb": round(mem_mb, 1),
+        "active_requests": _active_requests,
+        "max_concurrent": MAX_CONCURRENT,
+        "rate_tracked_ips": len(_rate_data),
         "db": DB_PATH,
         "time": datetime.now().isoformat()
     }
@@ -1706,31 +2160,42 @@ def health():
 
 @app.get("/api/bulk-predictions")
 def bulk(
+    request: Request,
     state: str = Query(default="Rajasthan"),
     city:  str = Query(default="Nagaur"),
     commodities: str = Query(default="AUTO"),
     force_refresh: bool = Query(default=False)
 ):
+    # SCALE FIX: Rate limit - max 5 bulk calls per minute per IP
+    ip = request.client.host if request.client else "unknown"
+    if not rate_check(ip, max_req=5, window=60):
+        raise HTTPException(status_code=429, detail={
+            "error": "Rate limit", "message": "1 minute me 5 se zyada bulk request allowed nahi", "retry_after": 60
+        })
+
     if commodities == "AUTO" or not commodities:
         comm_list = STATE_DATA.get(state, {}).get("crops",
                     list(GLOBAL_RANGES.keys())[:15])
     else:
         comm_list = [c.strip() for c in commodities.split(",") if c.strip()]
 
-    log.info("BULK %s/%s: %d crops force=%s", state, city, len(comm_list), force_refresh)
+    # SCALE FIX: max 15 crops per bulk request
+    comm_list = comm_list[:15]
+
+    log.info("BULK %s/%s: %d crops ip=%s force=%s", state, city, len(comm_list), ip, force_refresh)
     is_rain, impact, alert = get_weather(city)
     results = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:  # 4→8
-        futs = {
-            ex.submit(process, c, state, city, is_rain, impact, alert, force_refresh): c
-            for c in comm_list
-        }
-        for f in concurrent.futures.as_completed(futs, timeout=15):  # max 15s
-            try:
-                results.append(f.result())
-            except Exception as e:
-                log.error("BULK thread err: %s", e)
+    # SCALE FIX: use global pool - no new pool creation per request
+    futs = {
+        _GLOBAL_POOL.submit(process, c, state, city, is_rain, impact, alert, force_refresh): c
+        for c in comm_list
+    }
+    for f in concurrent.futures.as_completed(futs, timeout=15):
+        try:
+            results.append(f.result())
+        except Exception as e:
+            log.error("BULK thread err: %s", e)
 
     order = {"VERIFIED": 0, "SINGLE_SOURCE": 1, "UNVERIFIED": 2}
     results.sort(key=lambda x: order.get(x.get("priceStatus", "UNVERIFIED"), 3))
@@ -1846,10 +2311,10 @@ def seasonal_ep(
         return {
             "commodity": commodity, "currentPrice": None,
             "message": "भाव उपलब्ध नहीं",
-            "history7Day": item.get("history7Day"),
+            "history3Day": item.get("history3Day"),
         }
     seasonal = seasonal_prediction(commodity, state, price)
-    hist = item.get("history7Day", {})
+    hist = item.get("history3Day", {})
     ds   = item.get("demandSupply", {})
     cc   = item.get("crossCheck", {})
     return {
@@ -1866,16 +2331,16 @@ def seasonal_ep(
             "arrow": hist.get("arrow", "—"),
             "color": hist.get("arrowColor", "grey"),
         },
-        "history7Day": {
-            "chart": hist.get("chart7Day", []),
-            "weeklyHigh": hist.get("weekly7DayHigh"),
-            "weeklyLow": hist.get("weekly7DayLow"),
-            "weeklyAvg": hist.get("weekly7DayAvg"),
+        "history3Day": {
+            "chart": hist.get("chart3Day", []),
+            "high": hist.get("weekly3DayHigh"),
+            "low": hist.get("weekly3DayLow"),
+            "avg": hist.get("weekly3DayAvg"),
             "daysOfData": hist.get("daysOfData", 0),
         },
         "demandSupply": {
             "arrivalToday": ds.get("arrivalQty", 0),
-            "avg7Day": ds.get("avg7DayArrival"),
+            "avg3Day": ds.get("avg3DayArrival"),
             "supplyHindi": ds.get("supplyHindi", "N/A"),
             "demandHindi": ds.get("demandHindi", "N/A"),
             "trendHindi": ds.get("trendHindi", "N/A"),
@@ -1924,15 +2389,15 @@ def market_outlook(
             "pred30dPrice": round(price * (1 + pred_pct / 100)) if pred_pct is not None else None,
             "bechainIndex": item.get("bechainIndex", {}),
         }
-    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
-        for res in concurrent.futures.as_completed(
-                [ex.submit(_outlook_one, c) for c in crops], timeout=15):
-            try:
-                r = res.result()
-                if r:
-                    outlook.append(r)
-            except Exception:
-                pass
+    # SCALE FIX: use global pool
+    futs_out = [_GLOBAL_POOL.submit(_outlook_one, c) for c in crops]
+    for res in concurrent.futures.as_completed(futs_out, timeout=15):
+        try:
+            r = res.result()
+            if r:
+                outlook.append(r)
+        except Exception:
+            pass
     outlook.sort(key=lambda x: (
         0 if x["priceTrend"] == "UP" else
         1 if x["priceTrend"] == "STABLE" else 2
@@ -1995,35 +2460,63 @@ def markets(commodity: str = Query(...), state: str = Query(...)):
 
 @app.get("/api/mandipulse/calculate")
 def calculate(
-    commodity: str = Query(...),
-    state:     str = Query(...),
-    city:      str = Query(...)
+    commodity:       str   = Query(...),
+    state:           str   = Query(...),
+    city:            str   = Query(...),
+    qty_quintal:     float = Query(default=1.0, ge=0.1, le=10000),
+    transport_per_q: float = Query(default=0.0, ge=0.0, le=5000),
+    grade:           str   = Query(default="Average")
 ):
-    is_rain, impact, alert = get_weather(city)
-    r = process(commodity, state, city, is_rain, impact, alert)
+    is_rain, impact, alert_w = get_weather(city)
+    r = process(commodity, state, city, is_rain, impact, alert_w)
     price = r.get("currentPrice")
     msp_v = MSP.get(commodity, 0)
     if price is None:
         return {"commodityHindi": HINDI.get(commodity, commodity),
                 "location": city, "currentPrice": None, "dataAvailable": False}
+    grade_adj       = {"FAQ": 300, "Average": 0, "Below Average": -250}.get(grade, 0)
+    effective_price = price + grade_adj
+    gross_value     = round(effective_price * qty_quintal, 2)
+    transport_total = round(transport_per_q * qty_quintal, 2)
+    net_value       = round(gross_value - transport_total, 2)
+    net_per_q       = round(effective_price - transport_per_q, 2)
+    msp_total       = round(msp_v * qty_quintal, 2) if msp_v else None
     return {
-        "commodityHindi": HINDI.get(commodity, commodity),
-        "location": city, "currentPrice": price, "dataAvailable": True,
-        "bechainIndex": r.get("bechainIndex", {}),
-        "sourcesUsed": r.get("sourcesUsed", []),
-        "dataSourceCount": r.get("dataSourceCount", 0),
-        "history7Day": r.get("history7Day"),
-        "demandSupply": r.get("demandSupply"),
-        "crossCheck": r.get("crossCheck"),
-        "seasonalAnalysis": r.get("seasonalAnalysis"),
-        "mspCalculator": {
-            "mspValue": msp_v, "currentPrice": price,
-            "difference": round(price - msp_v, 2),
-            "hindi": "MSP के ऊपर" if price > msp_v else "MSP से नीचे",
-            "color": "green" if price > msp_v else "red",
-            "pct": round((price - msp_v) / msp_v * 100, 1) if msp_v else 0,
+        "commodityHindi":    HINDI.get(commodity, commodity),
+        "commodity":         commodity,
+        "location":          city,
+        "currentPrice":      price,
+        "dataAvailable":     True,
+        "mandiTiming":       mandi_is_open(),
+        "quantityCalc": {
+            "qtyQuintal":      qty_quintal,
+            "grade":           grade,
+            "gradeAdjustment": grade_adj,
+            "effectivePrice":  effective_price,
+            "grossValue":      gross_value,
+            "transportPerQ":   transport_per_q,
+            "transportTotal":  transport_total,
+            "netValue":        net_value,
+            "netPerQuintal":   net_per_q,
+            "mspTotalValue":   msp_total,
+            "summary":         "%d quintal x Rs%d = Rs%.0f (net Rs%.0f)" % (
+                                  int(qty_quintal), int(effective_price), gross_value, net_value),
         },
-        "weatherImpact": {"isRainExpected": is_rain, "alert": alert},
+        "mspCalculator": {
+            "mspValue":    msp_v, "currentPrice": price,
+            "difference":  round(price - msp_v, 2),
+            "hindi":       "MSP ke upar" if price > msp_v else "MSP se neeche",
+            "color":       "green" if price > msp_v else "red",
+            "pct":         round((price - msp_v) / msp_v * 100, 1) if msp_v else 0,
+        },
+        "bechainIndex":    r.get("bechainIndex", {}),
+        "sourcesUsed":     r.get("sourcesUsed", []),
+        "dataSourceCount": r.get("dataSourceCount", 0),
+        "history3Day":     r.get("history3Day"),
+        "demandSupply":    r.get("demandSupply"),
+        "crossCheck":      r.get("crossCheck"),
+        "seasonalAnalysis": r.get("seasonalAnalysis"),
+        "weatherImpact":   {"isRainExpected": is_rain, "alert": alert_w},
     }
 
 
@@ -2047,7 +2540,7 @@ def dashboard(
         "priceStatus": r.get("priceStatus", ""),
         "sourcesUsed": r.get("sourcesUsed", []),
         "bechainIndex": r.get("bechainIndex", {}),
-        "history7Day": r.get("history7Day"),
+        "history3Day": r.get("history3Day"),
         "demandSupply": r.get("demandSupply"),
         "crossCheck": r.get("crossCheck"),
         "seasonalAnalysis": r.get("seasonalAnalysis"),
@@ -2066,13 +2559,230 @@ def cache_clear(state: str = None, city: str = None):
     return {"message": "Cache cleared %s/%s" % (state or "ALL", city or "ALL")}
 
 
-@app.get("/api/listings/all")
-def listings(is_pro: bool = False):
-    # Stub endpoint - future feature
-    return {"listings": [], "message": "Listings feature coming soon", "total": 0}
 
+# ================================================================
+# LISTINGS — Real buy/sell board
+# ================================================================
+
+@app.get("/api/listings/all")
+def listings(
+    commodity: str = Query(default=None),
+    state:     str = Query(default=None),
+    ltype:     str = Query(default=None, description="SELL or BUY"),
+    limit:     int = Query(default=30, ge=1, le=100)
+):
+    data = db_listings_get(commodity=commodity, state=state, ltype=ltype, limit=limit)
+    return {
+        "total": len(data),
+        "listings": data,
+        "fetchedAt": datetime.now().isoformat()
+    }
 
 @app.post("/api/listings/add")
 def add_listing(data: dict):
-    # Stub endpoint - future feature
-    return {"status": "pending", "message": "Listings feature coming soon", "listingId": None}
+    required = ["type", "commodity", "state", "city", "qty_quintal", "price_per_q"]
+    for f in required:
+        if f not in data:
+            raise HTTPException(status_code=400, detail="Missing field: %s" % f)
+    if data.get("type") not in ("SELL", "BUY"):
+        raise HTTPException(status_code=400, detail="type must be SELL or BUY")
+    lid = db_listing_add(
+        ltype     = data["type"],
+        commodity = data["commodity"],
+        state     = data["state"],
+        city      = data["city"],
+        qty       = float(data["qty_quintal"]),
+        price     = float(data["price_per_q"]),
+        quality   = data.get("quality", "Average"),
+        contact   = data.get("contact", ""),
+        note      = data.get("note", ""),
+        days      = int(data.get("valid_days", 7))
+    )
+    if not lid:
+        raise HTTPException(status_code=500, detail="DB error")
+    return {"status": "success", "listingId": lid,
+            "message": "Listing %s saved" % lid}
+
+@app.delete("/api/listings/{listing_id}")
+def delete_listing(listing_id: str):
+    ok = db_listing_delete(listing_id)
+    return {"status": "deleted" if ok else "not_found", "listingId": listing_id}
+
+
+# ================================================================
+# PRICE ALERTS
+# ================================================================
+
+@app.post("/api/alerts/add")
+def alert_add(data: dict):
+    required = ["commodity", "state", "city", "target_price", "condition"]
+    for f in required:
+        if f not in data:
+            raise HTTPException(status_code=400, detail="Missing: %s" % f)
+    if data.get("condition") not in ("ABOVE", "BELOW"):
+        raise HTTPException(status_code=400, detail="condition must be ABOVE or BELOW")
+    aid = db_alert_add(
+        commodity    = data["commodity"],
+        state        = data["state"],
+        city         = data["city"],
+        target_price = float(data["target_price"]),
+        condition    = data["condition"],
+        contact      = data.get("contact", "")
+    )
+    if not aid:
+        raise HTTPException(status_code=500, detail="DB error")
+    cond_hi = "पहुँचने पर" if data["condition"] == "ABOVE" else "गिरने पर"
+    return {
+        "status": "success",
+        "alertId": aid,
+        "message": "%s भाव ₹%s %s alert set" % (
+            data["commodity"], data["target_price"], cond_hi)
+    }
+
+@app.get("/api/alerts/all")
+def alerts_get(
+    commodity: str = Query(default=None),
+    state:     str = Query(default=None)
+):
+    data = db_alerts_get(commodity=commodity, state=state)
+    return {"total": len(data), "alerts": data}
+
+@app.get("/api/alerts/check")
+def alerts_check_ep(
+    commodity: str = Query(...),
+    state:     str = Query(...),
+    city:      str = Query(...)
+):
+    """Manually check if any alerts triggered for a commodity right now."""
+    is_rain, impact, alert_w = get_weather(city)
+    r = process(commodity, state, city, is_rain, impact, alert_w)
+    price = r.get("currentPrice")
+    if not price:
+        return {"triggered": [], "currentPrice": None}
+    triggered = db_alerts_check(commodity, state, city, price)
+    return {
+        "currentPrice": price,
+        "triggered": triggered,
+        "triggeredCount": len(triggered)
+    }
+
+
+# ================================================================
+# USER PREFERENCES
+# ================================================================
+
+@app.get("/api/user/prefs/{user_id}")
+def prefs_get(user_id: str):
+    p = db_prefs_get(user_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="User not found")
+    return p
+
+@app.post("/api/user/prefs/{user_id}")
+def prefs_save(user_id: str, data: dict):
+    ok = db_prefs_save(
+        user_id       = user_id,
+        default_state = data.get("default_state", "Rajasthan"),
+        default_city  = data.get("default_city", "Nagaur"),
+        fav_crops     = data.get("fav_crops", [])
+    )
+    if not ok:
+        raise HTTPException(status_code=500, detail="Save failed")
+    return {"status": "saved", "user_id": user_id}
+
+@app.get("/api/user/dashboard/{user_id}")
+def user_dashboard(user_id: str):
+    """User ki saved mandi ka personalized dashboard."""
+    p = db_prefs_get(user_id)
+    state = p.get("default_state", "Rajasthan") if p else "Rajasthan"
+    city  = p.get("default_city",  "Nagaur")    if p else "Nagaur"
+    crops = p.get("fav_crops", [])               if p else []
+    if not crops:
+        crops = STATE_DATA.get(state, {}).get("crops", [])[:5]
+    is_rain, impact, alert_w = get_weather(city)
+    results = []
+    futs = [_GLOBAL_POOL.submit(process, c, state, city, is_rain, impact, alert_w)
+            for c in crops[:8]]
+    for f in concurrent.futures.as_completed(futs, timeout=15):
+        try:
+            results.append(f.result())
+        except Exception:
+            pass
+    results.sort(key=lambda x: 0 if x.get("currentPrice") else 1)
+    return {
+        "userId": user_id,
+        "state": state, "city": city,
+        "favCrops": crops,
+        "mandiTiming": mandi_is_open(),
+        "weather": {"isRain": is_rain, "alert": alert_w},
+        "prices": results,
+        "fetchedAt": datetime.now().isoformat()
+    }
+
+
+# ================================================================
+# MULTI-MANDI COMPARE
+# ================================================================
+
+@app.get("/api/compare")
+def compare_mandis(
+    commodity: str = Query(...),
+    state:     str = Query(...),
+    cities:    str = Query(..., description="Comma-separated: Nagaur,Jodhpur,Merta City")
+):
+    """Ek commodity ka alag alag mandis mein bhav compare karo."""
+    city_list = [c.strip() for c in cities.split(",") if c.strip()][:5]
+    if len(city_list) < 2:
+        raise HTTPException(status_code=400, detail="Kam se kam 2 cities do")
+    is_rain, impact, alert_w = get_weather(city_list[0])
+    results = {}
+    futs = {
+        _GLOBAL_POOL.submit(process, commodity, state, c, is_rain, impact, alert_w): c
+        for c in city_list
+    }
+    for f in concurrent.futures.as_completed(futs, timeout=15):
+        c = futs[f]
+        try:
+            r = f.result()
+            results[c] = {
+                "city":         c,
+                "currentPrice": r.get("currentPrice"),
+                "priceStatus":  r.get("priceStatus", ""),
+                "maxPrice":     r.get("maxPrice"),
+                "minPrice":     r.get("minPrice"),
+                "sourcesUsed":  r.get("sourcesUsed", []),
+                "bechainIndex": r.get("bechainIndex", {}),
+            }
+        except Exception:
+            results[c] = {"city": c, "currentPrice": None, "error": True}
+
+    prices_found = {c: v["currentPrice"] for c, v in results.items() if v.get("currentPrice")}
+    best_city    = max(prices_found, key=prices_found.get) if prices_found else None
+    worst_city   = min(prices_found, key=prices_found.get) if prices_found else None
+
+    return {
+        "commodity":      commodity,
+        "commodityHindi": HINDI.get(commodity, commodity),
+        "state":          state,
+        "results":        list(results.values()),
+        "bestCity":       best_city,
+        "bestPrice":      prices_found.get(best_city),
+        "worstCity":      worst_city,
+        "worstPrice":     prices_found.get(worst_city),
+        "diffAmount":     round(prices_found[best_city] - prices_found[worst_city], 2)
+                          if best_city and worst_city and best_city != worst_city else 0,
+        "advice":         "%s में ₹%d ज़्यादा मिलेगा" % (
+                           best_city, prices_found[best_city] - prices_found[worst_city])
+                          if best_city and worst_city and best_city != worst_city else "सभी मंडी समान",
+        "fetchedAt":      datetime.now().isoformat()
+    }
+
+
+# ================================================================
+# MANDI TIMING
+# ================================================================
+
+@app.get("/api/mandi-timing")
+def mandi_timing():
+    """Abhi mandi khuli hai ya band?"""
+    return mandi_is_open()
